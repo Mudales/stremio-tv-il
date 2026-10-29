@@ -1,30 +1,39 @@
 #!/usr/bin/env python3
-"""Build a static Stremio addon from the iptv-org Israel playlist.
+"""Build a static Stremio addon for Israeli TV from several public playlists.
 
-Downloads the M3U, parses it, and writes every addon endpoint as a plain
+Downloads every playlist in sources.json, merges entries that are the same
+channel (using channels.json aliases and the iptv-org channel database),
+checks which streams respond, and writes every addon endpoint as a plain
 JSON file under ./dist, ready to be served by GitHub Pages.
 
-Usage: python3 build.py [--playlist URL_OR_FILE] [--out DIR] [--base-url URL]
+Usage: python3 build.py [--out DIR] [--base-url URL] [--no-check]
 """
 import argparse
+import concurrent.futures
+import gzip
 import html
 import json
 import re
 import shutil
+import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-PLAYLIST_URL = "https://iptv-org.github.io/iptv/countries/il.m3u"
-ASSETS_DIR = Path(__file__).parent / "assets"
+ROOT = Path(__file__).parent
+ASSETS_DIR = ROOT / "assets"
+LOGOS_DIR = ASSETS_DIR / "logos"
+IPTV_DB = "https://iptv-org.github.io/api"
 ID_PREFIX = "iltv_"
 CATALOG_ID = "iltv"
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 MANIFEST = {
     "id": "community.iptv.israel",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "name": "Israeli TV",
-    "description": "Live Israeli TV channels from the public iptv-org playlist. Updated automatically.",
+    "description": "Live Israeli TV channels from several public playlists, with multiple sources per channel. Updated automatically.",
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "idPrefixes": [ID_PREFIX],
@@ -34,14 +43,26 @@ MANIFEST = {
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 QUALITY_RE = re.compile(r"\s*\((\d+p)\)")
 TAG_RE = re.compile(r"\s*\[([^\]]*)\]")
+# Variant suffixes in tvg-ids, e.g. kan11_hevc, reshet13_src2.
+VARIANT_RE = re.compile(r"_(hevc|subs|src\d+)$")
+VARIANT_LABELS = {"hevc": "HEVC", "subs": "Subtitles"}
+VARIANT_RANK = {"hevc": 2, "subs": 1}
 
 
-def fetch(source):
+def fetch(source, timeout=60):
     if re.match(r"https?://", source):
         req = urllib.request.Request(source, headers={"User-Agent": "stremio-il-builder"})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8", "replace")
-    return Path(source).read_text(encoding="utf-8")
+    return (ROOT / source).read_text(encoding="utf-8")
+
+
+def fetch_json(url):
+    try:
+        return json.loads(fetch(url))
+    except Exception as e:
+        print(f"warning: could not load {url}: {e}", file=sys.stderr)
+        return []
 
 
 def slugify(text):
@@ -78,38 +99,124 @@ def parse_m3u(text):
             entry = None
 
 
-def build_channels(entries):
-    """Group playlist entries into channels (one channel may have several streams)."""
-    channels = {}
-    for e in entries:
-        attrs, title = e["attrs"], e["title"]
-        quality = QUALITY_RE.search(title)
-        tags = TAG_RE.findall(title)
-        name = TAG_RE.sub("", QUALITY_RE.sub("", title)).strip()
-        name = re.sub(r"\s*\(Israel\)", "", name)
+def load_db():
+    """Channel names and logos from the iptv-org database, keyed by channel id."""
+    names = {c["id"]: c["name"] for c in fetch_json(f"{IPTV_DB}/channels.json")}
+    logos = {}
+    for l in fetch_json(f"{IPTV_DB}/logos.json"):
+        if l.get("feed") or not l.get("in_use", True):
+            continue
+        # Prefer raster formats (not every Stremio client renders SVG), then the widest.
+        score = (l.get("format") != "SVG", l.get("width") or 0)
+        if l["channel"] not in logos or score > logos[l["channel"]][0]:
+            logos[l["channel"]] = (score, l["url"])
+    return names, {k: v[1] for k, v in logos.items()}
 
-        tvg_id = attrs.get("tvg-id", "").split("@")[0]
-        cid = ID_PREFIX + slugify(tvg_id or name)
-        genres = [g.strip() for g in attrs.get("group-title", "").split(";") if g.strip()]
-        genres = ["Other" if g == "Undefined" else g for g in genres] or ["Other"]
 
-        ch = channels.setdefault(cid, {
-            "id": cid,
-            "name": name,
-            "logo": attrs.get("tvg-logo") or None,
-            "genres": [],
-            "streams": [],
-        })
-        for g in genres:
-            if g not in ch["genres"]:
-                ch["genres"].append(g)
-        ch["streams"].append({
-            "url": e["url"],
-            "quality": quality.group(1) if quality else None,
-            "tags": tags,
-            "headers": e["headers"],
-        })
+def resolve(entry, config):
+    """Return (canonical channel id, variant) for a playlist entry."""
+    raw = entry["attrs"].get("tvg-id", "").split("@")[0]
+    base, variant = raw, None
+    m = VARIANT_RE.search(raw)
+    if m:
+        base, variant = raw[:m.start()], m.group(1)
+    aliases = config["aliases"]
+    canon = aliases.get(raw) or aliases.get(base) or base
+    if not canon:
+        canon = TAG_RE.sub("", QUALITY_RE.sub("", entry["title"])).strip()
+    return canon, variant
+
+
+def clean_name(title):
+    name = TAG_RE.sub("", QUALITY_RE.sub("", title)).strip()
+    return re.sub(r"\s*\(Israel\)", "", name)
+
+
+def build_channels(sources, config, db_names, db_logos, base_url):
+    """Merge every source's entries into channels with one or more streams."""
+    channels, seen_urls = {}, set()
+    for prio, (src, entries) in enumerate(sources):
+        for e in entries:
+            # YouTube channel pages aren't playable stream URLs.
+            if e["url"] in seen_urls or "youtube.com" in e["url"]:
+                continue
+            seen_urls.add(e["url"])
+            canon, variant = resolve(e, config)
+            cid = ID_PREFIX + slugify(canon)
+            attrs, title = e["attrs"], e["title"]
+            custom = config["channels"].get(canon, {})
+
+            ch = channels.get(cid)
+            if ch is None:
+                genres = custom.get("genres") or [
+                    config["genres"].get(g.strip(), g.strip())
+                    for g in attrs.get("group-title", "").split(";") if g.strip()
+                ] or ["Other"]
+                ch = channels[cid] = {
+                    "id": cid,
+                    "name": custom.get("name") or db_names.get(canon) or clean_name(title),
+                    "logo": None,
+                    "genres": genres,
+                    "streams": [],
+                }
+            if not ch["logo"]:
+                logo = attrs.get("tvg-logo", "")
+                if logo.startswith("http"):
+                    ch["logo"] = logo
+                elif canon in db_logos:
+                    ch["logo"] = db_logos[canon]
+                elif (LOGOS_DIR / f"{canon}.png").exists():
+                    ch["logo"] = f"{base_url.rstrip('/')}/logos/{canon}.png"
+
+            quality = QUALITY_RE.search(title)
+            ch["streams"].append({
+                "url": e["url"],
+                "source": src["label"],
+                "priority": prio,
+                "variant": variant,
+                "quality": quality.group(1) if quality else None,
+                "tags": TAG_RE.findall(title),
+                "headers": e["headers"],
+                "ok": None,
+            })
     return sorted(channels.values(), key=lambda c: c["name"].lower())
+
+
+def probe(stream):
+    """True if the URL returns an HLS playlist. Run from GitHub's US servers,
+    so geo-blocked Israeli streams may fail here and still work in Israel."""
+    url = stream["url"]
+    if not url.startswith("http"):
+        return None
+    headers = {"User-Agent": BROWSER_UA, "Accept-Encoding": "gzip", **stream["headers"]}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as r:
+            body = r.read(4096)
+        if body[:2] == b"\x1f\x8b":
+            body = gzip.decompress(body)
+        return b"#EXTM3U" in body[:512]
+    except Exception:
+        # A truncated gzip read lands here too; treat any failure as down.
+        return False
+
+
+def check_streams(channels):
+    streams = [s for ch in channels for s in ch["streams"]]
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        for s, ok in zip(streams, pool.map(probe, streams)):
+            s["ok"] = ok
+
+
+def needs_proxy(s):
+    return s["url"].startswith("http://") or bool(s["headers"])
+
+
+def sort_streams(ch):
+    # Working streams first, then plain over HEVC/subtitle variants, then direct
+    # https streams (play everywhere, incl. web) over ones needing the proxy,
+    # then source priority.
+    ch["streams"].sort(key=lambda s: (s["ok"] is False, VARIANT_RANK.get(s["variant"], 0),
+                                      needs_proxy(s), s["priority"]))
 
 
 def meta_preview(ch):
@@ -127,25 +234,24 @@ def meta_preview(ch):
 def meta_full(ch):
     meta = meta_preview(ch)
     meta["background"] = ch["logo"]
-    meta["description"] = f"{ch['name']} — live. Genres: {', '.join(ch['genres'])}."
+    n = len(ch["streams"])
+    meta["description"] = (f"{ch['name']} — live. {n} source{'s' if n > 1 else ''}. "
+                           f"If one doesn't play, try the next. Genres: {', '.join(ch['genres'])}.")
     return meta
 
 
-def stremio_stream(s, idx, total):
-    label = "Live"
-    if total > 1:
-        label += f" #{idx + 1}"
-    details = [x for x in [s["quality"], *s["tags"]] if x]
+def stremio_stream(s, idx):
+    details = [s["source"], VARIANT_LABELS.get(s["variant"]), s["quality"], *s["tags"]]
     stream = {
         "url": s["url"],
-        "name": "Israeli TV",
-        "title": " · ".join([label, *details]),
+        "name": f"Source {idx + 1}",
+        "title": " · ".join(x for x in details if x),
     }
     hints = {}
     # Plain-http streams and streams needing custom headers can't play
     # directly in a browser; notWebReady routes them through Stremio's
     # local streaming server, which is also what applies proxyHeaders.
-    if s["url"].startswith("http://") or s["headers"]:
+    if needs_proxy(s):
         hints["notWebReady"] = True
     if s["headers"]:
         hints["proxyHeaders"] = {"request": s["headers"]}
@@ -210,15 +316,16 @@ a{{color:var(--accent)}}
 <section class="card"><h2>How to watch</h2><ol>
 <li>Install the addon using one of the options above.</li>
 <li>In Stremio go to <b>Discover → TV → Israeli TV</b>.</li>
-<li>Pick a genre (optional), choose a channel and press play.</li>
+<li>Pick a genre (optional), choose a channel, then pick a source (Source 1 is usually the best).</li>
 </ol></section>
 
 <section class="card"><h2>Genres</h2><div class="tags">{"".join(f"<span>{e(g)}</span>" for g in genres)}</div></section>
 
 <section class="card"><h2>Good to know</h2><ul class="muted" style="margin:0;padding-left:20px">
-<li>Use the Stremio <b>desktop, Android or TV</b> app. Most streams don't play on web.stremio.com.</li>
+<li>The Stremio <b>desktop, Android or TV</b> app is recommended. Some streams don't play on web.stremio.com.</li>
 <li>Many channels are geo-restricted and only play from Israel.</li>
-<li>Streams come from the public <a href="https://github.com/iptv-org/iptv">iptv-org</a> playlist; some may be offline at times.</li>
+<li>Each channel can have several sources. If one doesn't play, go back and pick the next one.</li>
+<li>Streams come from public playlists (<a href="https://github.com/iptv-org/iptv">iptv-org</a>, <a href="https://github.com/il90il90/m3u-tv">il90il90/m3u-tv</a>, <a href="https://github.com/Free-TV/IPTV">Free-TV</a>); some may be offline at times.</li>
 </ul></section>
 <p class="muted">Source code: <a href="https://github.com/Mudales/stremio-tv-il">github.com/Mudales/stremio-tv-il</a></p>
 </main></body></html>
@@ -228,24 +335,37 @@ a{{color:var(--accent)}}
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--playlist", default=PLAYLIST_URL)
     ap.add_argument("--out", default="dist")
-    ap.add_argument("--base-url", default="", help="Public URL of the site, used on the install page")
+    ap.add_argument("--base-url", default="", help="Public URL of the site (logos and install page)")
+    ap.add_argument("--no-check", action="store_true", help="Skip probing streams")
     args = ap.parse_args()
 
-    channels = build_channels(parse_m3u(fetch(args.playlist)))
+    config = json.loads((ROOT / "channels.json").read_text(encoding="utf-8"))
+    sources = []
+    for src in json.loads((ROOT / "sources.json").read_text(encoding="utf-8"))["sources"]:
+        try:
+            entries = list(parse_m3u(fetch(src["url"])))
+        except Exception as e:
+            print(f"warning: skipping source {src['id']}: {e}", file=sys.stderr)
+            continue
+        print(f"source {src['id']}: {len(entries)} entries")
+        sources.append((src, entries))
+
+    db_names, db_logos = load_db()
+    channels = build_channels(sources, config, db_names, db_logos, args.base_url)
     if not channels:
-        raise SystemExit("Playlist parsed to zero channels; refusing to publish an empty addon.")
+        raise SystemExit("Playlists parsed to zero channels; refusing to publish an empty addon.")
+    if not args.no_check:
+        check_streams(channels)
+    for ch in channels:
+        sort_streams(ch)
 
     out = Path(args.out)
     if out.exists():
         shutil.rmtree(out)
-    out.mkdir(parents=True)
+    shutil.copytree(ASSETS_DIR, out)
 
     genres = sorted({g for ch in channels for g in ch["genres"]})
-    for f in ASSETS_DIR.glob("*"):
-        shutil.copy(f, out / f.name)
-
     manifest = dict(MANIFEST)
     manifest["logo"] = f"{args.base_url.rstrip('/')}/logo.png" if args.base_url else "logo.png"
     manifest["catalogs"] = [{
@@ -264,14 +384,26 @@ def main():
 
     for ch in channels:
         write_json(out / "meta" / "tv" / f"{ch['id']}.json", {"meta": meta_full(ch)})
-        total = len(ch["streams"])
         write_json(out / "stream" / "tv" / f"{ch['id']}.json",
-                   {"streams": [stremio_stream(s, i, total) for i, s in enumerate(ch["streams"])]})
+                   {"streams": [stremio_stream(s, i) for i, s in enumerate(ch["streams"])]})
+
+    # Probe results, for debugging dead channels (as seen from the build machine).
+    write_json(out / "status.json", {
+        "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "channels": [{"id": ch["id"], "name": ch["name"],
+                      "streams": [{"source": s["source"], "variant": s["variant"],
+                                   "ok": s["ok"], "url": s["url"]} for s in ch["streams"]]}
+                     for ch in channels],
+    })
 
     (out / ".nojekyll").write_text("")
     write_index(out, args.base_url, len(channels), genres)
-    print(f"Built {len(channels)} channels, {sum(len(c['streams']) for c in channels)} streams, "
-          f"{len(genres)} genres -> {out}/")
+    streams = [s for c in channels for s in c["streams"]]
+    print(f"Built {len(channels)} channels, {len(streams)} streams "
+          f"({sum(s['ok'] is True for s in streams)} responding), {len(genres)} genres -> {out}/")
+    no_logo = [c["name"] for c in channels if not c["logo"]]
+    if no_logo:
+        print(f"channels without a logo: {', '.join(no_logo)}")
 
 
 if __name__ == "__main__":

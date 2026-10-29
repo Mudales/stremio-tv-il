@@ -34,18 +34,22 @@ https://mudales.github.io/stremio-tv-il/manifest.json
 
 1. Install the addon (see above).
 2. In Stremio go to **Discover → TV → Israeli TV**.
-3. Optionally filter by genre (News, Kids, Sports, Movies, …), pick a channel, and press play.
+3. Optionally filter by genre (News, Kids, Sports, Movies, …) and pick a channel.
+4. Pick a source. **Source 1 is usually the best**; if it doesn't play, go back and try the next one.
 
-Channels include Kan 11, Keshet 12, Channel 13, Now 14, i24NEWS, the Knesset Channel, Kan Educational, kids channels, and more.
+60+ channels, including Kan 11, Keshet 12, Channel 13, Now 14, Channel 9, i24NEWS, Sport 5, ONE,
+Viva, the Knesset Channel, Kan Educational, kids channels, and more. The main channels have
+several sources each, including HEVC and Hebrew-subtitled versions.
 
 ## Good to know
 
-- **Use the desktop, Android, or TV app.** Most streams are plain `http://` or need a custom
-  User-Agent, which browsers block, so they won't play on web.stremio.com.
+- **Desktop, Android, or TV app recommended.** Some streams are plain `http://` or need a custom
+  User-Agent, which browsers block, so those won't play on web.stremio.com.
 - **Geo-restrictions:** many channels only play from an Israeli IP address.
-- **Availability:** streams come from the community-maintained
-  [iptv-org](https://github.com/iptv-org/iptv) playlist. Some channels may be offline at any
-  given time; fixes upstream are picked up automatically on the next rebuild.
+- **Availability:** streams come from community-maintained playlists (see [Sources](#sources)).
+  Some may be offline at any given time; fixes upstream are picked up automatically on the
+  next rebuild.
+- **HEVC sources** use less bandwidth but may not play on older devices.
 
 ## How it works
 
@@ -54,22 +58,43 @@ channel list, all of them can be generated ahead of time, so the whole addon is 
 hosted for free on GitHub Pages.
 
 ```
-iptv-org il.m3u ──► build.py ──► dist/*.json ──► GitHub Pages ──► Stremio
-                      ▲
-        GitHub Actions: on push + every 6 hours
+playlists (sources.json) ──► build.py ──► dist/*.json ──► GitHub Pages ──► Stremio
+                               ▲
+                 GitHub Actions: on push + every 6 hours
 ```
 
-- [`build.py`](build.py) downloads the playlist, groups entries into channels, and writes every
-  endpoint as a JSON file (Python standard library only, nothing to install).
+- [`build.py`](build.py) downloads every playlist, merges entries that are the same channel into
+  one channel with several sources, probes each stream, and writes every endpoint as a JSON file
+  (Python standard library only, nothing to install).
+- Sources are ordered: **responding streams first**, then plain over HEVC/subtitle versions,
+  then direct `https` streams over ones that need Stremio's proxy, then playlist priority.
+  The probe runs on GitHub's servers in the US, so a geo-blocked stream can look down there
+  and still play in Israel; nothing is hidden, it only moves down the list.
+  Probe results are published at [`status.json`](https://mudales.github.io/stremio-tv-il/status.json).
 - [`.github/workflows/build.yml`](.github/workflows/build.yml) runs the build on every push and
   every 6 hours, then deploys `dist/` to GitHub Pages.
 - Streams that need special headers get `behaviorHints.proxyHeaders`, so Stremio's streaming
   server sends the right User-Agent / Referer.
 
+## Sources
+
+| Playlist | Label in Stremio |
+|---|---|
+| [iptv-org](https://github.com/iptv-org/iptv) `countries/il.m3u` | `iptv-org` |
+| [il90il90/m3u-tv](https://github.com/il90il90/m3u-tv) | `FreeTV` |
+| [Free-TV/IPTV](https://github.com/Free-TV/IPTV) `playlist_israel.m3u8` | `Free-TV` |
+
+- **Add a playlist:** add an entry to [`sources.json`](sources.json). Order is priority.
+- **Merge channels across playlists:** playlists name channels differently (`kan11`,
+  `Kan11.il@SD`, …). [`channels.json`](channels.json) maps each playlist's `tvg-id` to one
+  canonical [iptv-org channel id](https://iptv-org.github.io/api/channels.json); names and logos
+  come from the iptv-org database. Channels it doesn't know get a name and genre in
+  `channels.json` and a logo in [`assets/logos/`](assets/logos).
+
 ### Build locally
 
 ```bash
-python3 build.py
+python3 build.py            # add --no-check to skip probing streams
 python3 -m http.server -d dist 8080
 ```
 
@@ -82,10 +107,10 @@ Then open <http://localhost:8080/>.
 3. **Actions → Build & deploy addon → Run workflow**.
 4. Your addon is live at `https://<you>.github.io/<repo>/manifest.json`.
 
-To use a different country, change `PLAYLIST_URL` in `build.py` to another
-[iptv-org playlist](https://github.com/iptv-org/iptv#grouped-by-country).
+To use a different country, point [`sources.json`](sources.json) at other playlists, e.g. an
+[iptv-org country playlist](https://github.com/iptv-org/iptv#grouped-by-country).
 
 ## Disclaimer
 
 This addon doesn't host any content. It only links to publicly listed streams from the
-iptv-org playlist. All channels and trademarks belong to their respective owners.
+playlists above. All channels and trademarks belong to their respective owners.
